@@ -18,6 +18,8 @@
       ]
     },
     "noEmit": true,
+    "allowJs": true,
+    "checkJs": false,
     "skipLibCheck": false
   },
   "include": [

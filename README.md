@@ -1,142 +1,120 @@
-# bb-plugin-catchup
+# Catchup
 
-A BB plugin that keeps a todo list. It shows every surface a plugin can own:
+A BB plugin that owns a **daily catchup ledger**: which workstreams exist, what
+each one is doing, which issues are open, and what is blocked on you.
 
-- `server.ts` — the backend: a todo store in `bb.storage.kv`, RPC methods
-  for the page, a `bb catchup` CLI command, a setting, and a realtime signal
-  that keeps every open page current.
-- `app.tsx` — the frontend: an **Example todos** page in the left sidebar
-  (`app.slots.navPanel`) built from the vendored components.
-- `skills/example-todos/SKILL.md` — a skill that tells agents how to keep the list
-  with `bb catchup`. BB imports it into agent threads automatically.
-- `PLUGIN_OVERVIEW.md` — the store listing text: a longer version of
-  `bb.description` that the plugin detail page shows under it. See
-  [Store listing](#store-listing).
+It is not a task list. It is not a Pulse clone. Pulse (Third Hand) reads
+`bb catchup export --json` and decides what to surface; nothing in this plugin
+writes to Pulse.
 
-Try it: install the plugin, open **Example todos** in the sidebar, then run
-`bb catchup add "Ship it"` in a terminal. The page updates at once.
+## Surfaces
 
-## UI components
+| Surface | What it does |
+| --- | --- |
+| Catchup page (sidebar) | Read-only view: workstreams grouped, items with state and kind, last run and its errors. |
+| `bb catchup` | `sync`, `list`, `export`, `log`, `runs`. `--json` on all of them. |
+| `skills/catchup/SKILL.md` | Tells an agent how to read the ledger and what not to assume. |
 
-`components/ui/` is vendored source you own (the shadcn model): edit the
-files freely — they never update out from under you. Add more from the BB
-component registry (the full shadcn set, version-matched to your BB install
-via the pinned ref in `components.json`):
+## Data model
 
-```
-npx shadcn add @bb/select @bb/table
-```
+Two files in the plugin's data directory
+(`<dataDir>/plugins/catchup/`), both written atomically and at mode 0600:
 
-Run `npm install` once before `bb plugin build` — the vendored components'
-npm deps bundle into your dist. React, and BB-shimmed packages like the
-radix portal primitives and `sonner` (`import { toast } from "sonner"`
-reaches BB's own toaster), are provided by the BB app at runtime and never
-bundled. Every shimmed package is declared in `devDependencies` at the
-host's version so those imports typecheck; keep them there (never in
-`dependencies`, which would bundle a second copy), and `bb plugin types`
-repins declared packages alongside the SDK; unused packages may be removed. Ship `dist/` (npm tarball or committed for
-git installs) so people installing your plugin never need npm.
+- `ledger.json` — `{ version, updatedAt, workstreams[], items[] }`
+- `runs.jsonl` — one line per sync run, newest last
 
-## Manifest
-
-`package.json` is the plugin manifest. Notable fields:
-
-- `bb.server` — backend entry (required).
-- `bb.app` — frontend entry. Delete it, `app.tsx`, `components/`,
-  `hooks/`, and `lib/` for a headless plugin.
-- `bb.skills` — skill roots; omitted here, so BB reads `skills/`. Each
-  directory with a `SKILL.md` is one skill, named after the directory.
-- `bb.name` and `bb.description` — required human-facing identity.
-- `bb.branding` — required; declare `icon` as a BB icon name or a
-  plugin-relative compact SVG, or declare `logo.light` (with optional
-  `logo.dark`). Logo assets must be relative `.svg`, `.png`, or
-  `.webp` files.
-- `engines.bb` — supported bb app version range.
-- `engines.bbPluginSdk` — the lowest plugin SDK you need (scaffold:
-  `>=0.6.94`). BB reads this as a floor, not a ceiling: a later
-  SDK in the same major still loads your plugin.
-- `dependencies` — every package your source imports that BB does not provide.
-  `bb plugin build` inlines them into `dist/`, and git installs resolve this
-  list alone, so a build-required package here rather than in
-  `devDependencies` is what keeps your plugin installable. `devDependencies`
-  is for types and tooling only (BB shims React, the portal primitives, and
-  `@get-bb/plugin-sdk` at runtime — never bundle them).
-
-Run `bb plugin build` before publishing git/npm installs. It writes
-`dist/server.js` + `server.meta.json` and `app.js` / `app.css` /
-`app.meta.json`. Each `*.meta.json` stamps SDK major/version,
-`artifactFormatVersion`, `pluginId`, `pluginVersion`, and
-`builtWith` so managed installs can verify the artifacts. `app.meta.json`
-also lists `runtimeSlots`, the shimmed host modules the bundle imports.
-
-## Store listing
-
-Two texts describe the plugin in the store. `bb.description` in package.json
-is the one-sentence hook on every browse card and the lead paragraph on the
-detail page; keep it under about 140 characters. `PLUGIN_OVERVIEW.md` is the
-same claim at length, shown in an Overview section under that paragraph.
-Rewrite the scaffold's copy for your plugin, and update it whenever
-`bb.description` changes, so the two never disagree.
-
-The submission to the public BB Community marketplace requires the file. Keep
-it under 4000 characters (aim for 700 to 1800) and use headings, paragraphs,
-emphasis, code, blockquotes, lists, thematic breaks, and absolute https links
-only — raw HTML, images, tables, footnotes, and task lists are rejected. Do
-not open with a `#` title or repeat `bb.description` verbatim; the page
-shows both directly above.
-
-## Install
-
-From this directory (`bb plugin new` already ran the install; a fresh clone
-needs it):
+A **workstream** is a repo (`repo:<owner/repo>`) or a coordinator thread
+(`thread:<threadId>`). An **item** belongs to one workstream and has a stable id
+that never changes when its title, body, or state does:
 
 ```
-npm install
-bb plugin install .
+github:<owner/repo>#<number>      e.g. github:steveafrost/bb-plugin-catchup#7
 ```
 
-After editing sources, reload:
+Kinds: `issue`, `decision`, `blocker`, `release`, `note`. States: `open`,
+`done`, `blocked`. Sync v1 emits only `issue` and `blocker`; the other kinds
+exist so a future writer does not need a schema change.
+
+The ledger is **validated on read**. A damaged file throws rather than reading
+as empty — an empty ledger would look like "nothing is happening", which is the
+worst failure mode for this kind of tool.
+
+## Sync
+
+`bb catchup sync` reads every configured source and rewrites the ledger. Its
+rules:
+
+- **One dead source costs one run error.** A failing repo or thread is recorded
+  in `runs.jsonl`, its workstream is marked `blocked` with the reason, its
+  previous items are kept, and the rest of the run continues.
+- **Absent is not closed.** An issue that disappears from `gh issue list` after
+  a *successful* read is marked `done`, not deleted. After a *failed* read,
+  nothing is marked done.
+- **`gh` and `bb` calls are bounded** (30s, 8MB). A hung source becomes a
+  recorded error, not a stalled sync.
+- **No reasoning traces.** Issue bodies are clipped to 400 characters of a
+  single line; titles to 200; thread summaries to 240. The last agent message of
+  a thread is the summary — nothing walks the transcript.
+
+An idle thread with pending todos is `blocked`: something is waiting on
+someone. A thread with `status: error` is `blocked`. Threads never become `done`
+— BB has no "finished" thread status, and inventing one would be a lie.
+
+## Export
+
+`bb catchup export` projects open and blocked items into the shape Pulse reads:
 
 ```
-bb plugin reload catchup
+{ version, updatedAt, workstreams[], entries[] }
 ```
 
-Or let `bb plugin dev` rebuild and reload on every save.
+Each entry carries `id: "catchup:<itemId>"`, a Pulse `kind`
+(`decision | review | followup | fyi`), title, detail, url, `source: "catchup"`,
+the workstream, and up to three quick actions.
 
-## Configure
+**`catchup:<itemId>` is the contract.** Pulse keys its own user state (done,
+snooze, dismiss) on it, so it must stay stable across renames, edits, and state
+transitions. Changing the prefix or the id scheme orphans every item Pulse has
+already shown.
 
+## Settings
+
+Declarative, editable with `bb plugin config catchup`:
+
+| Setting | Shape |
+| --- | --- |
+| `repos` | Comma-separated `owner/repo` |
+| `coordinatorThreads` | Comma-separated thread ids, optionally `id=Label` |
+| `syncCron` | Cron expression. **Informational in v1** — nothing schedules sync yet. |
+
+A malformed entry becomes a run error naming the entry; it never aborts the run
+and never blocks the well-formed entries.
+
+## Deliberate v1 omissions
+
+- **Nothing schedules `sync`.** `syncCron` is recorded, not honoured. Adding a
+  timer means deciding what happens when it fires with no user present.
+- **Nothing writes item state by hand.** The panel is read-only. A manual writer
+  would create a second, unrecorded path into a ledger whose whole value is that
+  each row traces to a run.
+- **No Pulse-side code.** `export`'s contract is implemented; the consumer is
+  not this repo.
+- **No cross-repo grouping.** A workstream is one repo or one thread. Grouping
+  several repos under one workstream needs a stable grouping id that settings do
+  not have yet.
+
+## Development
+
+```bash
+npm install          # once
+npm run typecheck    # tsc --noEmit, clean
+npm test             # node --test test/*.test.mjs
+npm run build        # bb plugin build → dist/
 ```
-bb plugin config catchup
-bb plugin config catchup set showDone false
-bb plugin reload catchup
-```
 
-## Types & API reference
+`lib/*.mjs` is plain JavaScript so `node --test` loads it without a build step.
+Each module has a `.d.mts` beside it declaring the types `server.ts` compiles
+against; keep them in step when a signature changes.
 
-The plugin API ships as the npm package `@get-bb/plugin-sdk`, pinned to an
-exact version in `devDependencies` (`0.6.94` — the SDK of the BB
-that scaffolded this plugin). After `npm install`, the full surface is on disk
-at:
-
-```
-node_modules/@get-bb/plugin-sdk/bundled-types/bb-plugin-sdk.d.ts      # backend
-node_modules/@get-bb/plugin-sdk/bundled-types/bb-plugin-sdk-app.d.ts  # frontend
-```
-
-Your editor and `tsc` resolve `@get-bb/plugin-sdk` there through ordinary node
-resolution — no path mapping. These are readable declarations: open them for an
-exact signature.
-
-The SDK surface grows with every BB release, so the pin has to track the BB you
-actually run:
-
-```
-bb plugin types          # sync this plugin's SDK surface to the running BB
-bb plugin types --check  # CI: fail when it does not match
-```
-
-Ask BB to write plugins for you: the `bb-plugin-authoring` skill documents
-the whole surface with examples.
-
-Confused by the API, or need something the types don't explain? Clone the BB
-repo and read the source: <https://github.com/get-bb/bb>.
+Tests inject their dependencies (`listIssues`, `showThread`, `threadOutput`,
+`threadLog`), so no test shells out to `gh` or `bb` or touches the network.

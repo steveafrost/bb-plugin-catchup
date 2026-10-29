@@ -8,12 +8,15 @@
   },
   "bb": {
     "name": "Catchup",
-    "description": "A BB plugin with an example todo list.",
+    "description": "The daily catchup ledger: workstreams, their open issues, and what is blocked on you.",
     "branding": {
       "icon": "ListTodo"
     },
     "server": "./server.ts",
-    "app": "./app.tsx"
+    "app": "./app.tsx",
+    "skills": [
+      "skills"
+    ]
   },
   "dependencies": {
     "@radix-ui/react-checkbox": "^1.3.7",
@@ -46,5 +49,11 @@
     "sonner": "^1.7.4",
     "tailwind-merge": "^3.4.0",
     "vaul": "^1.1.2"
+  },
+  "description": "The daily catchup ledger: workstreams, their open issues, and what is blocked on you.",
+  "scripts": {
+    "build": "bb plugin build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs"
   }
 }

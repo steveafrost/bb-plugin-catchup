@@ -4,81 +4,136 @@
 // @get-bb/plugin-sdk/app are provided by the BB app at load time (never bundled),
 // so this file must be loaded by BB, not imported directly.
 //
-// The components under components/ui/ are YOURS: vendored source (shadcn
-// model), edit freely. Add more from the BB registry with
-// `npx shadcn add @bb/<name>` (see components.json) — dropdowns, tables,
-// the full shadcn set, version-matched to this BB install. Run
-// `npm install` once before `bb plugin build`.
+// Read-only by design: the ledger is written by `bb catchup sync`, and a
+// panel that could also write would give the user two ways to change the same
+// rows with only one of them recorded in the run history. Showing state plus
+// the last run is the whole job.
 import { useCallback, useEffect, useState } from "react";
-import type { FormEvent, ReactNode } from "react";
+import type { ReactNode } from "react";
 import { definePluginApp, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
-import type { rpcContract, Todo } from "./server";
-import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
+import type { rpcContract, Item, Ledger, Run, Workstream } from "./server";
 import { Icon } from "@/components/ui/icon";
-import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 
-/** The todo list, kept current by the server's "todos-changed" signal. */
-function useTodos() {
+type LedgerPayload = { ledger: Ledger; lastRun: Run | null };
+
+/** The ledger, kept current by the server's "ledger-changed" signal. */
+function useLedger() {
   const rpc = useRpc<typeof rpcContract>();
-  const [todos, setTodos] = useState<Todo[] | null>(null);
+  const [data, setData] = useState<LedgerPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const report = useCallback((cause: unknown) => {
-    setError(cause instanceof Error ? cause.message : String(cause));
-  }, []);
   const refetch = useCallback(() => {
-    rpc.call("todos_list").then((result) => {
-      setTodos(result.todos);
+    rpc.call("ledger_get").then((result) => {
+      setData(result);
       setError(null);
-    }, report);
-  }, [rpc, report]);
+    }, (cause: unknown) => {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    });
+  }, [rpc]);
   useEffect(() => {
     refetch();
   }, [refetch]);
-  // server.ts publishes after every write — from this page, another window,
-  // or `bb catchup add` run by an agent — so the list never goes stale.
-  useRealtime("todos-changed", refetch);
-  return { rpc, todos, error, report, refetch };
+  // sync publishes after every write, so a run started from a shell lands here
+  // without a manual refresh.
+  useRealtime("ledger-changed", refetch);
+  return { data, error };
 }
 
-function TodoRow({
-  todo,
-  onToggle,
-  onRemove,
-}: {
-  todo: Todo;
-  onToggle: (done: boolean) => void;
-  onRemove: () => void;
-}) {
+// State colours come from theme tokens, never hardcoded grays: `destructive`
+// for what needs the user, `muted` for asleep, default for moving.
+const WORKSTREAM_BADGE: Record<Workstream["state"], string> = {
+  active: "border-border bg-muted text-foreground",
+  blocked: "border-destructive/40 bg-destructive/10 text-destructive",
+  idle: "border-border bg-transparent text-muted-foreground",
+  done: "border-border bg-transparent text-muted-foreground line-through",
+};
+
+const KIND_LABEL: Record<Item["kind"], string> = {
+  issue: "issue",
+  decision: "decision",
+  blocker: "blocker",
+  release: "release",
+  note: "note",
+};
+
+function Badge({ children, className }: { children: ReactNode; className?: string }) {
   return (
-    <li className="flex items-center gap-3 py-2.5 text-sm">
-      <Checkbox
-        checked={todo.done}
-        onCheckedChange={(checked) => onToggle(checked === true)}
-        aria-label={`Mark "${todo.title}" ${todo.done ? "not done" : "done"}`}
-      />
-      <span
+    <span
+      className={cn(
+        "shrink-0 rounded-full border px-2 py-0.5 text-[11px] font-medium leading-4",
+        className,
+      )}
+    >
+      {children}
+    </span>
+  );
+}
+
+function ItemRow({ item }: { item: Item }) {
+  const body = (
+    <>
+      <Icon
+        name={item.kind === "blocker" ? "OctagonAlert" : "CircleDot"}
         className={cn(
-          "min-w-0 flex-1 truncate",
-          todo.done && "text-muted-foreground line-through",
+          "mt-0.5 size-3.5 shrink-0",
+          item.state === "blocked" ? "text-destructive" : "text-muted-foreground",
         )}
-      >
-        {todo.title}
+      />
+      <span className="min-w-0 flex-1">
+        <span className={cn("block truncate text-sm", item.state === "done" && "line-through text-muted-foreground")}>
+          {item.title}
+        </span>
+        {item.evidence === "" ? null : (
+          <span className="mt-0.5 block truncate font-mono text-[11px] text-muted-foreground">
+            {item.evidence}
+          </span>
+        )}
       </span>
-      <span className="hidden font-mono text-xs text-muted-foreground sm:inline">
-        {todo.id}
+      <span className="hidden shrink-0 font-mono text-[11px] text-muted-foreground sm:inline">
+        {item.id}
       </span>
-      <Button
-        variant="ghost"
-        size="icon"
-        className="size-7 text-muted-foreground hover:text-foreground"
-        aria-label={`Remove "${todo.title}"`}
-        onClick={onRemove}
+      <Badge className="border-border text-muted-foreground">{KIND_LABEL[item.kind]}</Badge>
+    </>
+  );
+  const className = "flex items-start gap-2.5 py-2";
+  // Only http(s) URLs reach the ledger (validated on read), and a plain anchor
+  // is enough: opening an issue in a tab should not need plugin plumbing.
+  return item.url === null ? (
+    <li className={className}>{body}</li>
+  ) : (
+    <li className={className}>
+      <a
+        href={item.url}
+        target="_blank"
+        rel="noreferrer"
+        className="flex min-w-0 flex-1 items-start gap-2.5 hover:underline"
       >
-        <Icon name="Trash2" className="size-4" />
-      </Button>
+        {body}
+      </a>
     </li>
+  );
+}
+
+function WorkstreamSection({ workstream, items }: { workstream: Workstream; items: Item[] }) {
+  return (
+    <section className="mt-5 first:mt-0">
+      <header className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+        <h2 className="min-w-0 truncate text-sm font-semibold">{workstream.name}</h2>
+        <Badge className={WORKSTREAM_BADGE[workstream.state]}>{workstream.state}</Badge>
+        <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+          {workstream.summary}
+        </span>
+      </header>
+      {items.length === 0 ? (
+        <p className="mt-1 pl-1 text-xs text-muted-foreground">No items.</p>
+      ) : (
+        <ul className="mt-1 divide-y divide-border overflow-hidden rounded-lg border border-border bg-card px-3">
+          {items.map((item) => (
+            <ItemRow key={item.id} item={item} />
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }
 
@@ -94,105 +149,89 @@ function EmptyState({ children }: { children: ReactNode }) {
   );
 }
 
-// Tailwind classes compile against the host theme's live CSS variables —
-// derive colors from the theme tokens, never hardcoded grays. The frame
-// (scrolling page, centered column) matches BB's own nav-panel pages.
-function TodosPage() {
-  const { rpc, todos, error, report, refetch } = useTodos();
-  const [title, setTitle] = useState("");
-  const [pending, setPending] = useState(false);
-  const add = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const next = title.trim();
-    if (next === "" || pending) return;
-    setPending(true);
-    try {
-      await rpc.call("todos_add", { title: next });
-      setTitle("");
-      refetch();
-    } catch (cause) {
-      report(cause);
-    } finally {
-      setPending(false);
-    }
-  };
-  const doneCount = todos?.filter((todo) => todo.done).length ?? 0;
+function RunFooter({ run }: { run: Run | null }) {
+  if (run === null) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        No sync has run yet. Run <code>bb catchup sync</code>.
+      </p>
+    );
+  }
+  return (
+    <div className="text-xs text-muted-foreground">
+      <p>
+        Last sync {new Date(run.finishedAt).toLocaleString()} — {run.workstreams} workstream(s),{" "}
+        {run.items} item(s)
+        {run.errors.length === 0 ? "" : `, ${run.errors.length} error(s)`}
+      </p>
+      {run.errors.length === 0 ? null : (
+        <ul className="mt-1 space-y-0.5">
+          {run.errors.map((entry, index) => (
+            <li key={`${entry.source}-${index}`} className="text-destructive">
+              <span className="font-mono">{entry.source}</span>: {entry.message}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// Tailwind classes compile against the host theme's live CSS variables. The
+// frame (scrolling page, centered column) matches BB's own nav-panel pages.
+function CatchupPage() {
+  const { data, error } = useLedger();
+  const ledger = data?.ledger ?? null;
   return (
     <div className="h-full min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto box-border w-full max-w-3xl px-4 pb-4 pt-3 md:px-5 md:pt-4">
         <p className="text-sm text-muted-foreground">
-          Agents keep this list with <code>bb catchup</code>; the skill in{" "}
-          <code>skills/example-todos</code> tells them how.
+          The daily catchup ledger: what each workstream is doing and what is blocked on you.
+          Collected by <code>bb catchup sync</code>; Pulse reads{" "}
+          <code>bb catchup export --json</code>.
         </p>
-        <form onSubmit={add} className="mt-4 flex items-center gap-2">
-          <Input
-            value={title}
-            onChange={(event) => setTitle(event.target.value)}
-            placeholder="What needs doing?"
-            aria-label="New todo"
-          />
-          <Button type="submit" disabled={pending || title.trim() === ""}>
-            <Icon name="Plus" className="size-4" />
-            Add
-          </Button>
-        </form>
         {error === null ? null : (
           <p role="alert" className="mt-3 text-sm text-destructive">
             {error}
           </p>
         )}
         <div className="mt-4">
-          {todos === null ? (
-            <EmptyState>Loading todos…</EmptyState>
-          ) : todos.length === 0 ? (
+          {ledger === null ? (
+            <EmptyState>Loading the ledger…</EmptyState>
+          ) : ledger.workstreams.length === 0 ? (
             <EmptyState>
-              Nothing to do. Add one above, or run{" "}
-              <code>bb catchup add "Ship it"</code>.
+              Nothing collected yet. Set <code>repos</code> and{" "}
+              <code>coordinatorThreads</code> in the Catchup settings, then run{" "}
+              <code>bb catchup sync</code>.
             </EmptyState>
           ) : (
-            <ul className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-card px-4">
-              {todos.map((todo) => (
-                <TodoRow
-                  key={todo.id}
-                  todo={todo}
-                  onToggle={(done) => {
-                    rpc
-                      .call("todos_set_done", { id: todo.id, done })
-                      .then(refetch, report);
-                  }}
-                  onRemove={() => {
-                    rpc
-                      .call("todos_remove", { id: todo.id })
-                      .then(refetch, report);
-                  }}
-                />
-              ))}
-            </ul>
+            ledger.workstreams.map((workstream) => (
+              <WorkstreamSection
+                key={workstream.id}
+                workstream={workstream}
+                items={ledger.items.filter((item) => item.workstreamId === workstream.id)}
+              />
+            ))
           )}
         </div>
-        {todos !== null && todos.length > 0 ? (
-          <p className="mt-2 text-xs text-muted-foreground">
-            {doneCount} of {todos.length} done
-          </p>
-        ) : null}
+        <div className="mt-4">
+          <RunFooter run={data?.lastRun ?? null} />
+        </div>
       </div>
     </div>
   );
 }
 
 // The default export must be definePluginApp(...); BB interprets it after
-// loading the bundle. navPanel adds a page to the left sidebar; register
-// other UI under app.slots and composer actions, plus-menu rows, banners, or
-// rich-text rules with app.composer.customize(...) (see the bb guide's
-// plugins chapter).
+// loading the bundle. navPanel adds a page to the left sidebar.
 export default definePluginApp((app) => {
   app.slots.navPanel({
-    id: "example-todos",
-    title: "Example todos",
+    id: "catchup",
+    title: "Catchup",
     icon: "ListTodo",
-    // Routed at /plugins/catchup/example-todos; the component receives the
-    // remainder as `subPath` for deep links within the page.
-    path: "example-todos",
-    component: TodosPage,
+    // Routed at /plugins/catchup/catchup; the component receives the remainder
+    // as `subPath` for deep links within the page.
+    path: "catchup",
+    component: CatchupPage,
   });
 });
